@@ -293,14 +293,15 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
 
 void CRRobotRos2::pubFeedBackInfo()
 {
-    std::shared_ptr<RealTimeData> realTimeData;
+    RealTimeData realTimeDataLocal{};
+    RealTimeData *realTimeData = &realTimeDataLocal;
 
     // 设置发布频率为100Hz
     rclcpp::Rate rate(100);
 
     while (rclcpp::ok())
     {
-        realTimeData = commander_->getRealData();
+        realTimeDataLocal = commander_->getRealDataSnapshot();
         nlohmann::json root;
 
         root["len"] = realTimeData->len;

@@ -86,6 +86,22 @@ public:
      */
     bool tcpRecv(void *buf, uint32_t len, uint32_t &has_read, uint32_t timeout);
 
+    /**
+     * tcpRecvExact
+     *
+     * Reads exactly `len` bytes into `buf`.
+     * Returns false on timeout (with `has_read` set to the bytes read so far).
+     */
+    bool tcpRecvExact(void *buf, uint32_t len, uint32_t &has_read, uint32_t timeout);
+
+    /**
+     * tcpRecvUntil
+     *
+     * Reads up to `max_len` bytes, stopping once `terminator` is observed as the
+     * last byte read. Intended for ASCII/dashboard responses.
+     */
+    bool tcpRecvUntil(void *buf, uint32_t max_len, uint32_t &has_read, uint32_t timeout, char terminator);
+
     std::string toString();
 };
 

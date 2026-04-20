@@ -46,9 +46,13 @@ void TcpClient::disConnect()
 {
     if (is_connected_)
     {
+        const int fd = fd_;
         fd_ = -1;
         is_connected_ = false;
-        ::close(fd_);
+        if (fd >= 0)
+        {
+            ::close(fd);
+        }
     }
 }
 
@@ -80,52 +84,100 @@ void TcpClient::tcpSend(const void *buf, uint32_t len)
 
 bool TcpClient::tcpRecv(void *buf, uint32_t len, uint32_t &has_read, uint32_t timeout)
 {
-    uint8_t *tmp = (uint8_t *)buf; // NOLINT(modernize-use-auto)
+    // Legacy behavior: this was historically used to receive dashboard/ASCII responses
+    // terminated with ';'. Keeping this behavior avoids breaking callers.
+    return tcpRecvUntil(buf, len, has_read, timeout, ';');
+}
+
+bool TcpClient::tcpRecvExact(void *buf, uint32_t len, uint32_t &has_read, uint32_t timeout)
+{
+    if (!is_connected_)
+        throw TcpClientException("tcp is disconnected");
+
+    auto *out = static_cast<uint8_t *>(buf);
     fd_set read_fds;
     timeval tv = {0, 0};
 
     has_read = 0;
-    while (len)
+    while (has_read < len)
     {
         FD_ZERO(&read_fds);
         FD_SET(fd_, &read_fds);
 
         tv.tv_sec = timeout / 1000;
         tv.tv_usec = (timeout % 1000) * 1000;
-        int err = ::select(fd_ + 1, &read_fds, nullptr, nullptr, &tv);
-        if (err < 0)
+        const int sel = ::select(fd_ + 1, &read_fds, nullptr, nullptr, &tv);
+        if (sel < 0)
         {
             disConnect();
             throw TcpClientException(toString() + std::string(" select() : ") + strerror(errno));
         }
-        else if (err == 0)
+        if (sel == 0)
         {
             return false;
         }
 
-        err = (int)::read(fd_, tmp, len);
-        if (err < 0)
+        const int rd = static_cast<int>(::read(fd_, out + has_read, len - has_read));
+        if (rd < 0)
         {
             disConnect();
             throw TcpClientException(toString() + std::string(" ::read() ") + strerror(errno));
         }
-        else if (err == 0)
+        if (rd == 0)
         {
             disConnect();
             throw TcpClientException(toString() + std::string(" tcp server has disconnected"));
         }
-        len -= err;
-        tmp += (err - 1);
+        has_read += static_cast<uint32_t>(rd);
+    }
+    return true;
+}
 
-        if (tmp[0] == ';')
+bool TcpClient::tcpRecvUntil(void *buf, uint32_t max_len, uint32_t &has_read, uint32_t timeout, char terminator)
+{
+    if (!is_connected_)
+        throw TcpClientException("tcp is disconnected");
+
+    auto *out = static_cast<uint8_t *>(buf);
+    fd_set read_fds;
+    timeval tv = {0, 0};
+
+    has_read = 0;
+    while (has_read < max_len)
+    {
+        FD_ZERO(&read_fds);
+        FD_SET(fd_, &read_fds);
+
+        tv.tv_sec = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+        const int sel = ::select(fd_ + 1, &read_fds, nullptr, nullptr, &tv);
+        if (sel < 0)
         {
-            has_read += err;
-            return true;
+            disConnect();
+            throw TcpClientException(toString() + std::string(" select() : ") + strerror(errno));
+        }
+        if (sel == 0)
+        {
+            return false;
         }
 
-        tmp++;
-        has_read += err;
-        //std::cout << "sbfeed:" << has_read << std::endl;
+        const int rd = static_cast<int>(::read(fd_, out + has_read, max_len - has_read));
+        if (rd < 0)
+        {
+            disConnect();
+            throw TcpClientException(toString() + std::string(" ::read() ") + strerror(errno));
+        }
+        if (rd == 0)
+        {
+            disConnect();
+            throw TcpClientException(toString() + std::string(" tcp server has disconnected"));
+        }
+
+        has_read += static_cast<uint32_t>(rd);
+        if (out[has_read - 1] == static_cast<uint8_t>(terminator))
+        {
+            return true;
+        }
     }
     return true;
 }

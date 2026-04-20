@@ -125,7 +125,7 @@ protected:
     static constexpr double PI = 3.1415926;
 
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     double current_joint_[6];
     double tool_vector_[6];
     std::shared_ptr<RealTimeData> real_time_data_;
@@ -149,6 +149,7 @@ public:
     bool isConnected() const;
     uint16_t getRobotMode() const;
     std::shared_ptr<RealTimeData> getRealData() const;
+    RealTimeData getRealDataSnapshot() const;
 
 private:
     static void doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd, int32_t &err_id,
