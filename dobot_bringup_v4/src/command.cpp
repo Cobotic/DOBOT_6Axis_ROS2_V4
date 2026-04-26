@@ -177,6 +177,9 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
     std::ignore = result;
     try
     {
+        // If we fail before parsing a response, keep an explicit failure code.
+        // Callers should initialize err_id, but this provides a backstop.
+        err_id = -1;
         uint32_t has_read = 0;
         char buf[1024];
         memset(buf, 0, sizeof(buf));
@@ -185,7 +188,14 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
         auto valueMS = currentTime_ms.time_since_epoch().count();
         std::cout <<"time: "<<valueMS <<"  tcp send cmd :" << cmd << std::endl;
 
-        tcp->tcpSend(cmd, strlen(cmd));
+        // Dobot dashboard expects newline-terminated ASCII commands.
+        std::string cmd_line(cmd);
+        if (cmd_line.empty() || cmd_line.back() != '\n')
+        {
+            cmd_line.push_back('\n');
+        }
+
+        tcp->tcpSend(cmd_line.c_str(), static_cast<uint32_t>(cmd_line.size()));
 
         if (!tcp->tcpRecvUntil(buf, sizeof(buf) - 1, has_read, 5000, ';'))
         {
@@ -193,7 +203,8 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
         }
         buf[std::min<uint32_t>(has_read, sizeof(buf) - 1)] = '\0';
         const char *recv_ptr = buf;
-        for (int i = 0; i < 2000;i++)  //赋值
+        const uint32_t scan_n = std::min<uint32_t>(has_read, static_cast<uint32_t>(sizeof(buf) - 1));
+        for (uint32_t i = 0; i < scan_n; i++)  //赋值
         {
             if (recv_ptr[i] == '{')
             {
@@ -210,7 +221,8 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
     }
     catch (const std::logic_error &err)
     {
-        std::cout << "tcpDoCmd failed " << std::endl;
+        std::cout << "tcpDoCmd failed: " << err.what() << std::endl;
+        throw;
     }
 }
 
@@ -221,6 +233,7 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
     std::ignore = result;
     try
     {
+        err_id = -1;
         uint32_t has_read = 0;
         char buf[1024];
         memset(buf, 0, sizeof(buf));
@@ -228,7 +241,13 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
         auto currentTime_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(currentTime);
         auto valueMS = currentTime_ms.time_since_epoch().count();
         std::cout <<"time: "<<valueMS <<"  tcp send cmd :" << cmd << std::endl;
-        tcp->tcpSend(cmd, strlen(cmd));
+        // Dobot dashboard expects newline-terminated ASCII commands.
+        std::string cmd_line(cmd);
+        if (cmd_line.empty() || cmd_line.back() != '\n')
+        {
+            cmd_line.push_back('\n');
+        }
+        tcp->tcpSend(cmd_line.c_str(), static_cast<uint32_t>(cmd_line.size()));
 
         if (!tcp->tcpRecvUntil(buf, sizeof(buf) - 1, has_read, 5000, ';'))
         {
@@ -236,8 +255,9 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
         }
         buf[std::min<uint32_t>(has_read, sizeof(buf) - 1)] = '\0';
         const char *recv_ptr = buf;
-        int pose1 = 0;
-        for (int i = 0; i < 2000;i++)  //赋值
+        int pose1 = -1;
+        const uint32_t scan_n = std::min<uint32_t>(has_read, static_cast<uint32_t>(sizeof(buf) - 1));
+        for (uint32_t i = 0; i < scan_n; i++)  //赋值
         {
             if (recv_ptr[i] == '{')
             {
@@ -246,14 +266,17 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
                 int num = stringToInt(result);
                 err_id = num;
                 std::cout << "ErrorID: " << num<< std::endl;
-                pose1 = i;
+                pose1 = static_cast<int>(i);
             }
             if (recv_ptr[i] == '}')
             {
-                std::string str(recv_ptr); // 将char*类型转为string类型
-                std::string result = str.substr(pose1, i-pose1+1); // 使用substr函数截取指定长度的子字符串
-                mode_id = result;
-                break;
+                if (pose1 >= 0)
+                {
+                    std::string str(recv_ptr); // 将char*类型转为string类型
+                    std::string result = str.substr(static_cast<size_t>(pose1), static_cast<size_t>(i - pose1 + 1)); // 使用substr函数截取指定长度的子字符串
+                    mode_id = result;
+                    break;
+                }
             }
             
         }
@@ -261,7 +284,8 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
     }
     catch (const std::logic_error &err)
     {
-        std::cout << "tcpDoCmd failed " << std::endl;
+        std::cout << "tcpDoCmd failed: " << err.what() << std::endl;
+        throw;
     }
 }
 
@@ -273,9 +297,8 @@ bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id)
         doTcpCmd(this->dash_board_tcp_, cmd.c_str(), err_id, result_);
         return true;
     }
-    catch (const TcpClientException &err)
+    catch (const std::exception &err)
     {
-        std::cout << "%s" << std::endl;
         err_id = -1;
         return false;
     }
@@ -288,9 +311,8 @@ bool CRCommanderRos2::callRosService_f(const std::string cmd, int32_t &err_id,st
         doTcpCmd_f(this->dash_board_tcp_, cmd.c_str(), err_id,mode_id, result_);
         return true;
     }
-    catch (const TcpClientException &err)
+    catch (const std::exception &err)
     {
-        std::cout << "%s" << std::endl;
         err_id = -1;
         return false;
     }
@@ -302,9 +324,8 @@ bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id, std
         doTcpCmd(this->dash_board_tcp_, cmd.c_str(), err_id, result_);
         return true;
     }
-    catch (const TcpClientException &err)
+    catch (const std::exception &err)
     {
-        std::cout << "%s" << std::endl;
         err_id = -1;
         return false;
     }

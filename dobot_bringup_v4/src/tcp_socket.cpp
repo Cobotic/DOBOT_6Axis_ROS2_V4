@@ -158,7 +158,10 @@ bool TcpClient::tcpRecvUntil(void *buf, uint32_t max_len, uint32_t &has_read, ui
         }
         if (sel == 0)
         {
-            return false;
+            // If we've already received some bytes, treat this as end-of-message.
+            // Some dashboard servers don't send an explicit terminator and simply
+            // stop sending after a short response.
+            return has_read > 0;
         }
 
         const int rd = static_cast<int>(::read(fd_, out + has_read, max_len - has_read));
@@ -169,6 +172,12 @@ bool TcpClient::tcpRecvUntil(void *buf, uint32_t max_len, uint32_t &has_read, ui
         }
         if (rd == 0)
         {
+            // If the peer closes after sending a response, treat it as end-of-message.
+            if (has_read > 0)
+            {
+                disConnect();
+                return true;
+            }
             disConnect();
             throw TcpClientException(toString() + std::string(" tcp server has disconnected"));
         }

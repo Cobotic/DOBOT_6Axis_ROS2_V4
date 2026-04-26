@@ -211,11 +211,11 @@ namespace parseTool
         std::stringstream ss;
         ss << "PositiveKin(";
         ss << request->j1 << "," << request->j2 << "," << request->j3 << "," << request->j4 << "," << request->j5 << ","
-           << request->j6 << ",";
+           << request->j6;
         if (request->user != "")
             ss << ",user=" << request->user;
         if (request->tool != "")
-            ss << ", tool=" << request->tool;
+            ss << ",tool=" << request->tool;
         ss << ")";
         return ss.str();
     }
@@ -224,8 +224,16 @@ namespace parseTool
         // InverseKin(X,Y,Z,Rx,Ry,Rz,User,Tool,useJointNear,JointNear)
         std::stringstream ss;
         ss << "InverseKin(" << request->x << "," << request->y << "," << request->z << "," << request->rx << "," << request->ry
-           << "," << request->rz << ", user=" << request->user << ",tool=" << request->tool
-           << ",useJointNear=" << request->use_joint_near << ",jointNear=" << request->joint_near << ")";
+           << "," << request->rz;
+        if (request->use_joint_near != "")
+            ss << ",useJointNear=" << request->use_joint_near;
+        if (request->joint_near != "")
+            ss << ",jointNear=" << request->joint_near;
+        if (request->user != "")
+            ss << ",user=" << request->user;
+        if (request->tool != "")
+            ss << ",tool=" << request->tool;
+        ss << ")";
         return ss.str();
     }
     std::string parserGetAngleRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::GetAngle::Request> request)
