@@ -1,6 +1,22 @@
 #include <dobot_bringup/cr_robot_ros2.h>
 #include <sensor_msgs/msg/joint_state.hpp>
 
+#include <algorithm>
+#include <builtin_interfaces/msg/duration.hpp>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <condition_variable>
+#include <deque>
+#include <iomanip>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <thread>
+
+#include <pthread.h>
+#include <sched.h>
+
 CRRobotRos2::CRRobotRos2() : rclcpp::Node("dobot_bringup_ros2"){};
 
 void CRRobotRos2::init()
@@ -18,6 +34,76 @@ void CRRobotRos2::init()
     this->declare_parameter("robot_node_name", "dobot_bringup_ros2");
     this->declare_parameter("robot_number", 1);
 
+    // FollowJointTrajectory -> ServoJ tuning
+    this->declare_parameter("follow_joint_trajectory_early_send_s", 0.03);
+    this->declare_parameter("follow_joint_trajectory_min_servoj_t_s", 0.004);
+    this->declare_parameter("follow_joint_trajectory_async_servoj", false);
+    this->declare_parameter("follow_joint_trajectory_async_queue_max", 50);
+
+    // Feedback publishing is moved to a separate node (cr_robot_ros2_feedback_node).
+    // Keep this default off to minimize interference with trajectory streaming.
+    this->declare_parameter("publish_feed_info", false);
+
+    {
+        bool param_async_servoj = false;
+        int param_async_queue_max = 50;
+        this->get_parameter("follow_joint_trajectory_async_servoj", param_async_servoj);
+        this->get_parameter("follow_joint_trajectory_async_queue_max", param_async_queue_max);
+        if (param_async_queue_max < 1) param_async_queue_max = 1;
+
+        bool async_servoj = param_async_servoj;
+        const char *env_async = std::getenv("ANYROB_FJT_ASYNC_SERVOJ");
+        if (env_async != nullptr) {
+            if (env_async[0] != '\0' && std::strcmp(env_async, "0") != 0 && std::strcmp(env_async, "false") != 0 &&
+                std::strcmp(env_async, "False") != 0) {
+                async_servoj = true;
+            }
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "FJT async ServoJ config (startup): param(follow_joint_trajectory_async_servoj)=%s env(ANYROB_FJT_ASYNC_SERVOJ)=%s -> async_servoj=%s queue_max=%d",
+                    param_async_servoj ? "true" : "false",
+                    (env_async ? env_async : "<unset>"),
+                    async_servoj ? "true" : "false",
+                    param_async_queue_max);
+    }
+
+    auto maybe_enable_sched_fifo = [this](const char *where) {
+        const char *enabled = std::getenv("ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO");
+        if (enabled == nullptr || enabled[0] == '\0' || std::strcmp(enabled, "0") == 0 || std::strcmp(enabled, "false") == 0 ||
+            std::strcmp(enabled, "False") == 0) {
+            return;
+        }
+
+        int prio = 50;
+        if (const char *p = std::getenv("ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO_PRIORITY")) {
+            try {
+                prio = std::stoi(p);
+            } catch (...) {
+                prio = 50;
+            }
+        }
+        if (prio < 1) prio = 1;
+        if (prio > 99) prio = 99;
+
+        sched_param sp;
+        std::memset(&sp, 0, sizeof(sp));
+        sp.sched_priority = prio;
+        const int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+        if (rc != 0) {
+            RCLCPP_WARN(this->get_logger(),
+                        "SCHED_FIFO enable failed (%s, prio=%d). Need CAP_SYS_NICE and rtprio ulimit. Error: %s",
+                        where,
+                        prio,
+                        std::strerror(rc));
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(), "SCHED_FIFO enabled (%s, prio=%d)", where, prio);
+    };
+
+    // Enable FIFO as early as possible so subsequently created threads inherit it.
+    maybe_enable_sched_fifo("CRRobotRos2::init");
+
     this->get_parameter("robot_ip_address", robotIp);
     this->get_parameter("robot_type", robotType);
     this->get_parameter("trajectory_duration", trajectoryDuration);
@@ -28,9 +114,13 @@ void CRRobotRos2::init()
     RCLCPP_INFO(this->get_logger(), "robotType  %s", robotType.c_str());
     RCLCPP_INFO(this->get_logger(), "trajectoryDuration %f", trajectoryDuration);
 
-    if (robotNumber > 1)
+    // Namespace-aware naming: ensure services/topics live under the ROS namespace
+    // passed via `__ns` (e.g. /robot1). This avoids collisions when running multiple
+    // robot instances.
+    kRobotName = this->get_namespace();
+    if (kRobotName == "/")
     {
-        kRobotName = robotNodeName + "/";
+        kRobotName = "";
     }
 
     std::string serviceEnableRobot = kRobotName + "/dobot_bringup_ros2/srv/EnableRobot";
@@ -47,7 +137,7 @@ void CRRobotRos2::init()
     std::string serviceToolDOInstant = kRobotName + "/dobot_bringup_ros2/srv/ToolDOInstant";
     std::string serviceAO = kRobotName + "/dobot_bringup_ros2/srv/AO";
     std::string serviceAOInstant = kRobotName + "/dobot_bringup_ros2/srv/AOInstant";
-    std::string serviceAccJ = +"/dobot_bringup_ros2/srv/AccJ";
+    std::string serviceAccJ = kRobotName + "/dobot_bringup_ros2/srv/AccJ";
     std::string serviceAccL = kRobotName + "/dobot_bringup_ros2/srv/AccL";
     std::string serviceVelJ = kRobotName + "/dobot_bringup_ros2/srv/VelJ";
     std::string serviceVelL = kRobotName + "/dobot_bringup_ros2/srv/VelL";
@@ -286,9 +376,251 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     //kTimer = this->create_wall_timer(std::chrono::seconds(2), std::bind(&CRRobotRos2::backendTask, this));
     commander_ = std::make_shared<CRCommanderRos2>(robotIp);
     commander_->init();
-    kPublisherInfo = this->create_publisher<std_msgs::msg::String>(topicFeedInfo, 10);
-    threadPubFeedBackInfo = std::thread(&CRRobotRos2::pubFeedBackInfo, this);
-    threadPubFeedBackInfo.detach();
+
+    {
+        // Expose a single, robot-type-independent FollowJointTrajectory action name.
+        // Use a *relative* name so ROS2 namespace remapping (e.g. __ns:=/robot1)
+        // automatically scopes it to the instance.
+        const std::string actionName = "group_controller/follow_joint_trajectory";
+        follow_joint_trajectory_server_ = rclcpp_action::create_server<FollowJointTrajectory>(
+            this,
+            actionName,
+            std::bind(&CRRobotRos2::handle_follow_joint_trajectory_goal, this, std::placeholders::_1, std::placeholders::_2),
+            std::bind(&CRRobotRos2::handle_follow_joint_trajectory_cancel, this, std::placeholders::_1),
+            std::bind(&CRRobotRos2::handle_follow_joint_trajectory_accepted, this, std::placeholders::_1));
+        RCLCPP_INFO(this->get_logger(), "FollowJointTrajectory action ready on: %s", actionName.c_str());
+    }
+
+    {
+        bool publish_feed_info = false;
+        this->get_parameter("publish_feed_info", publish_feed_info);
+        if (publish_feed_info)
+        {
+            kPublisherInfo = this->create_publisher<std_msgs::msg::String>(topicFeedInfo, 10);
+            threadPubFeedBackInfo = std::thread(&CRRobotRos2::pubFeedBackInfo, this);
+            threadPubFeedBackInfo.detach();
+            RCLCPP_INFO(this->get_logger(), "FeedInfo publisher enabled in driver node");
+        }
+        else
+        {
+            RCLCPP_INFO(this->get_logger(), "FeedInfo publisher disabled in driver node (use feedback node)");
+        }
+    }
+}
+
+rclcpp_action::GoalResponse CRRobotRos2::handle_follow_joint_trajectory_goal(
+    const rclcpp_action::GoalUUID &uuid,
+    std::shared_ptr<const FollowJointTrajectory::Goal> goal)
+{
+    (void)uuid;
+
+    if (!goal) {
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    if (follow_joint_trajectory_active_.load()) {
+        RCLCPP_WARN(this->get_logger(), "Rejecting FollowJointTrajectory goal: another goal is active");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    const auto &traj = goal->trajectory;
+    if (traj.points.empty()) {
+        RCLCPP_WARN(this->get_logger(), "Rejecting FollowJointTrajectory goal: empty trajectory");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    for (const auto &pt : traj.points) {
+        if (pt.positions.size() < 6) {
+            RCLCPP_WARN(this->get_logger(), "Rejecting FollowJointTrajectory goal: point has < 6 positions");
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+    }
+
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse CRRobotRos2::handle_follow_joint_trajectory_cancel(
+    const std::shared_ptr<GoalHandleFollowJointTrajectory> goal_handle)
+{
+    (void)goal_handle;
+    RCLCPP_INFO(this->get_logger(), "FollowJointTrajectory cancel requested");
+    return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+void CRRobotRos2::handle_follow_joint_trajectory_accepted(
+    const std::shared_ptr<GoalHandleFollowJointTrajectory> goal_handle)
+{
+    std::thread{&CRRobotRos2::execute_follow_joint_trajectory, this, goal_handle}.detach();
+}
+
+static double duration_to_seconds(const builtin_interfaces::msg::Duration &d)
+{
+    return static_cast<double>(d.sec) + static_cast<double>(d.nanosec) * 1e-9;
+}
+
+static double rad_to_deg(const double rad)
+{
+    static const double kPi = std::acos(-1.0);
+    return rad * (180.0 / kPi);
+}
+
+void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHandleFollowJointTrajectory> goal_handle)
+{
+    // If FIFO was enabled, apply it to this execution thread as well.
+    {
+        const char *enabled = std::getenv("ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO");
+        if (enabled != nullptr && enabled[0] != '\0' && std::strcmp(enabled, "0") != 0 && std::strcmp(enabled, "false") != 0 &&
+            std::strcmp(enabled, "False") != 0) {
+            int prio = 50;
+            if (const char *p = std::getenv("ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO_PRIORITY")) {
+                try {
+                    prio = std::stoi(p);
+                } catch (...) {
+                    prio = 50;
+                }
+            }
+            if (prio < 1) prio = 1;
+            if (prio > 99) prio = 99;
+            sched_param sp;
+            std::memset(&sp, 0, sizeof(sp));
+            sp.sched_priority = prio;
+            const int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+            if (rc != 0) {
+                RCLCPP_WARN(this->get_logger(),
+                            "SCHED_FIFO enable failed (FollowJointTrajectory thread, prio=%d): %s",
+                            prio,
+                            std::strerror(rc));
+            }
+        }
+    }
+
+    if (!goal_handle) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(follow_joint_trajectory_mutex_);
+        if (follow_joint_trajectory_active_.exchange(true)) {
+            auto result = std::make_shared<FollowJointTrajectory::Result>();
+            result->error_code = -1;
+            result->error_string = "Another FollowJointTrajectory goal is already running";
+            goal_handle->abort(result);
+            return;
+        }
+    }
+
+    struct ActiveGuard
+    {
+        explicit ActiveGuard(std::atomic_bool &flag) : flag_(flag) {}
+        ~ActiveGuard() { flag_.store(false); }
+        std::atomic_bool &flag_;
+    } active_guard(follow_joint_trajectory_active_);
+
+    const auto goal = goal_handle->get_goal();
+    const auto &traj = goal->trajectory;
+    const auto &points = traj.points;
+
+    double min_servoj_t_s = 0.004;
+    this->get_parameter("follow_joint_trajectory_min_servoj_t_s", min_servoj_t_s);
+    min_servoj_t_s = std::max(0.0, min_servoj_t_s);
+
+    auto sleep_with_cancel = [&](double seconds) -> bool {
+        if (seconds <= 0.0) {
+            return true;
+        }
+        auto remaining = std::chrono::duration<double>(seconds);
+        while (remaining.count() > 0.0) {
+            if (!rclcpp::ok()) {
+                return false;
+            }
+            if (goal_handle->is_canceling()) {
+                return false;
+            }
+            const auto chunk = (remaining > std::chrono::duration<double>(0.005)) ? std::chrono::duration<double>(0.005) : remaining;
+            std::this_thread::sleep_for(chunk);
+            remaining -= chunk;
+        }
+        return true;
+    };
+
+    auto feedback = std::make_shared<FollowJointTrajectory::Feedback>();
+    feedback->joint_names = traj.joint_names;
+
+    double last_tfs = 0.0;
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (!rclcpp::ok()) {
+            auto result = std::make_shared<FollowJointTrajectory::Result>();
+            result->error_code = -1;
+            result->error_string = "Node shutting down";
+            goal_handle->abort(result);
+            return;
+        }
+        if (goal_handle->is_canceling()) {
+            auto result = std::make_shared<FollowJointTrajectory::Result>();
+            result->error_code = -1;
+            result->error_string = "Canceled";
+            goal_handle->canceled(result);
+            return;
+        }
+
+        const auto &pt = points[i];
+        const double tfs = duration_to_seconds(pt.time_from_start);
+        const double dt_raw = (i == 0) ? tfs : (tfs - last_tfs);
+        last_tfs = tfs;
+
+        // dt is the desired loop period for this point (from time_from_start deltas).
+        // Clamp to >= 0 to avoid negative sleeps on malformed trajectories.
+        const double dt = std::max(0.0, dt_raw);
+
+        const double dt_cmd = std::max(min_servoj_t_s, dt);
+
+        auto servo_req = std::make_shared<dobot_msgs_v4::srv::ServoJ::Request>();
+        servo_req->a = rad_to_deg(pt.positions[0]);
+        servo_req->b = rad_to_deg(pt.positions[1]);
+        servo_req->c = rad_to_deg(pt.positions[2]);
+        servo_req->d = rad_to_deg(pt.positions[3]);
+        servo_req->e = rad_to_deg(pt.positions[4]);
+        servo_req->f = rad_to_deg(pt.positions[5]);
+
+        std::ostringstream tparam;
+        tparam.setf(std::ios::fixed);
+        tparam << std::setprecision(3) << "t=" << dt_cmd;
+        servo_req->param_value = {tparam.str()};
+
+        const std::string cmd = parseTool::parserServoJRequest2String(servo_req);
+        // Timing model (requested): for each point, measure the TCP send time
+        // and then wait out the remainder of dt.
+        const auto t0 = std::chrono::steady_clock::now();
+        int err = 0;
+        const bool ok = commander_->callRosService(cmd, err);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!ok) {
+            auto result = std::make_shared<FollowJointTrajectory::Result>();
+            result->error_code = -1;
+            result->error_string = "ServoJ failed (TCP/robot error)";
+            goal_handle->abort(result);
+            return;
+        }
+
+        feedback->desired.positions = pt.positions;
+        feedback->desired.time_from_start = pt.time_from_start;
+        goal_handle->publish_feedback(feedback);
+
+        const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+        const double wait_s = dt - elapsed_s;
+        if (!sleep_with_cancel(wait_s)) {
+            auto result = std::make_shared<FollowJointTrajectory::Result>();
+            result->error_code = -1;
+            result->error_string = "Canceled";
+            goal_handle->canceled(result);
+            return;
+        }
+    }
+
+    auto result = std::make_shared<FollowJointTrajectory::Result>();
+    result->error_code = 0;
+    result->error_string = "";
+    goal_handle->succeed(result);
 }
 
 void CRRobotRos2::pubFeedBackInfo()

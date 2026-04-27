@@ -17,10 +17,13 @@
 #include <nlohmann/json.hpp>
 #include <string>
 #include <memory>
+#include <atomic>
+#include <mutex>
 #include <dobot_bringup/parseTool.h>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_action/create_server.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <dobot_bringup/command.h>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <dobot_msgs_v4/srv/enable_robot.hpp>
@@ -159,6 +162,9 @@ public:
     bool isEnable() const;
     bool isConnected() const;
     void getToolVectorActual(double *val);
+
+    using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
+    using GoalHandleFollowJointTrajectory = rclcpp_action::ServerGoalHandle<FollowJointTrajectory>;
 
 protected:
     /**
@@ -417,10 +423,26 @@ private:
     void getErrorID(std::vector<int> &Vec);
     void pubFeedBackInfo();
 
+    rclcpp_action::GoalResponse handle_follow_joint_trajectory_goal(
+        const rclcpp_action::GoalUUID &uuid,
+        std::shared_ptr<const FollowJointTrajectory::Goal> goal);
+
+    rclcpp_action::CancelResponse handle_follow_joint_trajectory_cancel(
+        const std::shared_ptr<GoalHandleFollowJointTrajectory> goal_handle);
+
+    void handle_follow_joint_trajectory_accepted(
+        const std::shared_ptr<GoalHandleFollowJointTrajectory> goal_handle);
+
+    void execute_follow_joint_trajectory(const std::shared_ptr<GoalHandleFollowJointTrajectory> goal_handle);
+
 private:
     std::string kRobotName;
     std::shared_ptr<CRCommanderRos2> commander_;
     std::thread threadPubFeedBackInfo;
+
+    std::shared_ptr<rclcpp_action::Server<FollowJointTrajectory>> follow_joint_trajectory_server_;
+    std::atomic_bool follow_joint_trajectory_active_{false};
+    std::mutex follow_joint_trajectory_mutex_;
 };
 
 #endif // CRROBOTROS2_H

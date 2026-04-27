@@ -21,6 +21,8 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(control_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(dobot_msgs_v4 REQUIRED)
 
 
@@ -32,6 +34,8 @@ include_directories(
 
 add_executable(${PROJECT_NAME}_node src/main.cpp src/cr_robot_ros2.cpp src/command.cpp src/tcp_socket.cpp src/parseTool.cpp)
 
+add_executable(${PROJECT_NAME}_feedback_node src/feedback_node.cpp src/command.cpp src/tcp_socket.cpp)
+
 target_include_directories(${PROJECT_NAME}_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>) 
@@ -42,6 +46,16 @@ ament_target_dependencies(
   "rclcpp_action"
   "std_msgs"
   "sensor_msgs"
+  "control_msgs"
+  "trajectory_msgs"
+  "dobot_msgs_v4"
+)
+
+ament_target_dependencies(
+  ${PROJECT_NAME}_feedback_node
+  "rclcpp"
+  "std_msgs"
+  "sensor_msgs"
   "dobot_msgs_v4"
 )
 
@@ -49,7 +63,11 @@ target_link_libraries(${PROJECT_NAME}_node
         pthread
         )
 
-install(TARGETS ${PROJECT_NAME}_node
+target_link_libraries(${PROJECT_NAME}_feedback_node
+  pthread
+  )
+
+install(TARGETS ${PROJECT_NAME}_node ${PROJECT_NAME}_feedback_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config

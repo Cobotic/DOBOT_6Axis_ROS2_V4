@@ -50,11 +50,15 @@ class FollowJointTrajectoryServer(Node):
 
     def __init__(self):
         super().__init__('dobot_group_controller')
-        name = (os.getenv("DOBOT_TYPE") or "").strip() or "cr5"
         # 创建FollowJointTrajectory动作服务器
         # Use a *relative* name so the action server respects the node namespace.
-        # When this node runs under /robot1, the action becomes /robot1/<type>_group_controller/follow_joint_trajectory.
-        self._action_server = ActionServer(self,FollowJointTrajectory,f'{name}_group_controller/follow_joint_trajectory',self.execute_callback)
+        # Expose a single, robot-type-independent action name.
+        self._action_server = ActionServer(
+            self,
+            FollowJointTrajectory,
+            'group_controller/follow_joint_trajectory',
+            self.execute_callback,
+        )
         self.get_logger().info("FollowJointTrajectory Action Server is ready...")
         self.EnableRobot_l = self.create_client(EnableRobot, '/dobot_bringup_ros2/srv/EnableRobot')
         self.ServoJ_l = self.create_client(ServoJ, '/dobot_bringup_ros2/srv/ServoJ')

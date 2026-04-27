@@ -67,10 +67,24 @@ bool recv_realtime_frame(TcpClient &tcp, RealTimeData &out, uint32_t timeout_ms)
 CRCommanderRos2::CRCommanderRos2(const std::string &ip)
     : current_joint_{}, tool_vector_{}, is_running_(false)
 {
+    enable_dashboard_ = true;
     is_running_ = false;
     real_time_data_ = std::make_shared<RealTimeData>();
     real_time_tcp_ = std::make_shared<TcpClient>(ip, 30004);
     dash_board_tcp_ = std::make_shared<TcpClient>(ip, 29999);
+}
+
+CRCommanderRos2::CRCommanderRos2(const std::string &ip, bool enable_dashboard)
+    : current_joint_{}, tool_vector_{}, is_running_(false)
+{
+    enable_dashboard_ = enable_dashboard;
+    is_running_ = false;
+    real_time_data_ = std::make_shared<RealTimeData>();
+    real_time_tcp_ = std::make_shared<TcpClient>(ip, 30004);
+    if (enable_dashboard_)
+    {
+        dash_board_tcp_ = std::make_shared<TcpClient>(ip, 29999);
+    }
 }
 
 CRCommanderRos2::~CRCommanderRos2()
@@ -140,17 +154,20 @@ void CRCommanderRos2::recvTask()
             }
         }
 
-        if (!dash_board_tcp_->isConnect())
+        if (enable_dashboard_ && dash_board_tcp_)
         {
-            try
+            if (!dash_board_tcp_->isConnect())
             {
-                dash_board_tcp_->connect();
-            }
-            catch (const TcpClientException &err)
-            {
+                try
+                {
+                    dash_board_tcp_->connect();
+                }
+                catch (const TcpClientException &err)
+                {
 
-                std::cout << "tcp recv ERROR : %s" << std::endl;
-                sleep(3);
+                    std::cout << "tcp recv ERROR : %s" << std::endl;
+                    sleep(3);
+                }
             }
         }
     }
@@ -291,6 +308,11 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
 
 bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id)
 {
+    if (!enable_dashboard_ || !dash_board_tcp_)
+    {
+        err_id = -1;
+        return false;
+    }
     try
     {
         std::vector<std::string> result_;
@@ -305,6 +327,11 @@ bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id)
 }
 bool CRCommanderRos2::callRosService_f(const std::string cmd, int32_t &err_id,std::string &mode_id)
 {
+    if (!enable_dashboard_ || !dash_board_tcp_)
+    {
+        err_id = -1;
+        return false;
+    }
     try
     {
         std::vector<std::string> result_;
@@ -319,6 +346,11 @@ bool CRCommanderRos2::callRosService_f(const std::string cmd, int32_t &err_id,st
 }
 bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id, std::vector<std::string> &result_)
 {
+    if (!enable_dashboard_ || !dash_board_tcp_)
+    {
+        err_id = -1;
+        return false;
+    }
     try
     {
         doTcpCmd(this->dash_board_tcp_, cmd.c_str(), err_id, result_);
@@ -339,7 +371,15 @@ bool CRCommanderRos2::isEnable() const
 
 bool CRCommanderRos2::isConnected() const
 {
-    return dash_board_tcp_->isConnect() && real_time_tcp_->isConnect();
+    if (!real_time_tcp_)
+    {
+        return false;
+    }
+    if (enable_dashboard_)
+    {
+        return dash_board_tcp_ && dash_board_tcp_->isConnect() && real_time_tcp_->isConnect();
+    }
+    return real_time_tcp_->isConnect();
 }
 
 uint16_t CRCommanderRos2::getRobotMode() const

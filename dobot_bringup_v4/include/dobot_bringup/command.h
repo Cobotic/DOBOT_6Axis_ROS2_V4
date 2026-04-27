@@ -133,9 +133,11 @@ private:
     std::unique_ptr<std::thread> thread_;
     std::shared_ptr<TcpClient> real_time_tcp_;
     std::shared_ptr<TcpClient> dash_board_tcp_;
+    bool enable_dashboard_{true};
 
 public:
     explicit CRCommanderRos2(const std::string &ip);
+    CRCommanderRos2(const std::string &ip, bool enable_dashboard);
 
     ~CRCommanderRos2();
     void getCurrentJointStatus(double *joint);

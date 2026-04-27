@@ -4,9 +4,9 @@ moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControll
 
 moveit_simple_controller_manager:
   controller_names:
-    - cr5_group_controller
+    - group_controller
 
-  cr5_group_controller:
+  group_controller:
     type: FollowJointTrajectory
     action_ns: follow_joint_trajectory
     default: true
