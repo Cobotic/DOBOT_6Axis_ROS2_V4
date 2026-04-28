@@ -520,31 +520,87 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
     const auto &traj = goal->trajectory;
     const auto &points = traj.points;
 
+    double early_send_s = 0.03;
     double min_servoj_t_s = 0.004;
+    this->get_parameter("follow_joint_trajectory_early_send_s", early_send_s);
     this->get_parameter("follow_joint_trajectory_min_servoj_t_s", min_servoj_t_s);
+    early_send_s = std::max(0.0, early_send_s);
     min_servoj_t_s = std::max(0.0, min_servoj_t_s);
 
-    auto sleep_with_cancel = [&](double seconds) -> bool {
-        if (seconds <= 0.0) {
-            return true;
+    bool param_async_servoj = false;
+    int async_queue_max = 50;
+    this->get_parameter("follow_joint_trajectory_async_servoj", param_async_servoj);
+    this->get_parameter("follow_joint_trajectory_async_queue_max", async_queue_max);
+    if (async_queue_max < 1) async_queue_max = 1;
+
+    bool async_servoj = param_async_servoj;
+
+    // Optional override via env var (handy in containers): ANYROB_FJT_ASYNC_SERVOJ=1
+    const char *env_async = std::getenv("ANYROB_FJT_ASYNC_SERVOJ");
+    if (env_async != nullptr) {
+        if (env_async[0] != '\0' && std::strcmp(env_async, "0") != 0 && std::strcmp(env_async, "false") != 0 &&
+            std::strcmp(env_async, "False") != 0) {
+            async_servoj = true;
         }
-        auto remaining = std::chrono::duration<double>(seconds);
-        while (remaining.count() > 0.0) {
-            if (!rclcpp::ok()) {
-                return false;
-            }
-            if (goal_handle->is_canceling()) {
-                return false;
-            }
-            const auto chunk = (remaining > std::chrono::duration<double>(0.005)) ? std::chrono::duration<double>(0.005) : remaining;
-            std::this_thread::sleep_for(chunk);
-            remaining -= chunk;
-        }
-        return true;
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+                "FJT async ServoJ config (goal): param(follow_joint_trajectory_async_servoj)=%s env(ANYROB_FJT_ASYNC_SERVOJ)=%s -> async_servoj=%s queue_max=%d",
+                param_async_servoj ? "true" : "false",
+                (env_async ? env_async : "<unset>"),
+                async_servoj ? "true" : "false",
+                async_queue_max);
+
+    struct ServoJob
+    {
+        std::string cmd;
     };
+
+    std::mutex q_mu;
+    std::condition_variable q_cv;
+    std::condition_variable q_cv_space;
+    std::deque<ServoJob> q;
+    bool q_stop = false;
+    bool worker_failed = false;
+    int32_t worker_err_id = 0;
+
+    std::unique_ptr<std::thread> worker;
+    if (async_servoj) {
+        RCLCPP_INFO(this->get_logger(), "FollowJointTrajectory: async ServoJ enabled (queue_max=%d)", async_queue_max);
+        worker = std::make_unique<std::thread>([&]() {
+            while (true) {
+                ServoJob job;
+                {
+                    std::unique_lock<std::mutex> lk(q_mu);
+                    q_cv.wait(lk, [&]() { return q_stop || !q.empty(); });
+                    if (q_stop && q.empty()) {
+                        return;
+                    }
+                    job = std::move(q.front());
+                    q.pop_front();
+                    q_cv_space.notify_one();
+                }
+
+                int32_t err = 0;
+                const bool ok = commander_->callRosService(job.cmd, err);
+                if (!ok) {
+                    worker_failed = true;
+                    worker_err_id = err;
+                    // Stop consuming further commands; let the action thread observe and abort.
+                    std::lock_guard<std::mutex> lk(q_mu);
+                    q_stop = true;
+                    q_cv.notify_all();
+                    q_cv_space.notify_all();
+                    return;
+                }
+            }
+        });
+    }
 
     auto feedback = std::make_shared<FollowJointTrajectory::Feedback>();
     feedback->joint_names = traj.joint_names;
+
+    const auto start_time = std::chrono::steady_clock::now();
 
     double last_tfs = 0.0;
     for (size_t i = 0; i < points.size(); ++i) {
@@ -565,14 +621,29 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
 
         const auto &pt = points[i];
         const double tfs = duration_to_seconds(pt.time_from_start);
-        const double dt_raw = (i == 0) ? tfs : (tfs - last_tfs);
+        const double dt = (i == 0) ? tfs : (tfs - last_tfs);
         last_tfs = tfs;
 
-        // dt is the desired loop period for this point (from time_from_start deltas).
-        // Clamp to >= 0 to avoid negative sleeps on malformed trajectories.
-        const double dt = std::max(0.0, dt_raw);
-
         const double dt_cmd = std::max(min_servoj_t_s, dt);
+        const double send_at = std::max(0.0, tfs - early_send_s);
+
+        const auto send_time = start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(send_at));
+
+        while (std::chrono::steady_clock::now() < send_time) {
+            if (goal_handle->is_canceling()) {
+                auto result = std::make_shared<FollowJointTrajectory::Result>();
+                result->error_code = -1;
+                result->error_string = "Canceled";
+                goal_handle->canceled(result);
+                return;
+            }
+            const auto remaining = send_time - std::chrono::steady_clock::now();
+            const auto max_chunk = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::milliseconds(5));
+            const auto chunk = (remaining < max_chunk) ? remaining : max_chunk;
+            std::this_thread::sleep_for(chunk);
+        }
 
         auto servo_req = std::make_shared<dobot_msgs_v4::srv::ServoJ::Request>();
         servo_req->a = rad_to_deg(pt.positions[0]);
@@ -588,31 +659,62 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
         servo_req->param_value = {tparam.str()};
 
         const std::string cmd = parseTool::parserServoJRequest2String(servo_req);
-        // Timing model (requested): for each point, measure the TCP send time
-        // and then wait out the remainder of dt.
-        const auto t0 = std::chrono::steady_clock::now();
-        int err = 0;
-        const bool ok = commander_->callRosService(cmd, err);
-        const auto t1 = std::chrono::steady_clock::now();
-        if (!ok) {
-            auto result = std::make_shared<FollowJointTrajectory::Result>();
-            result->error_code = -1;
-            result->error_string = "ServoJ failed (TCP/robot error)";
-            goal_handle->abort(result);
-            return;
+        if (async_servoj) {
+            if (worker_failed) {
+                auto result = std::make_shared<FollowJointTrajectory::Result>();
+                result->error_code = -1;
+                result->error_string = "ServoJ worker failed";
+                goal_handle->abort(result);
+                break;
+            }
+
+            {
+                std::unique_lock<std::mutex> lk(q_mu);
+                q_cv_space.wait(lk, [&]() { return q_stop || static_cast<int>(q.size()) < async_queue_max; });
+                if (q_stop) {
+                    auto result = std::make_shared<FollowJointTrajectory::Result>();
+                    result->error_code = -1;
+                    result->error_string = "ServoJ worker stopped";
+                    goal_handle->abort(result);
+                    break;
+                }
+                q.push_back(ServoJob{cmd});
+                q_cv.notify_one();
+            }
+        } else {
+            int err = 0;
+            const bool ok = commander_->callRosService(cmd, err);
+            if (!ok) {
+                auto result = std::make_shared<FollowJointTrajectory::Result>();
+                result->error_code = -1;
+                result->error_string = "ServoJ failed (TCP/robot error)";
+                goal_handle->abort(result);
+                return;
+            }
         }
 
         feedback->desired.positions = pt.positions;
         feedback->desired.time_from_start = pt.time_from_start;
         goal_handle->publish_feedback(feedback);
+    }
 
-        const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-        const double wait_s = dt - elapsed_s;
-        if (!sleep_with_cancel(wait_s)) {
+    if (async_servoj) {
+        {
+            std::unique_lock<std::mutex> lk(q_mu);
+            // Wait until queue drains or a worker failure occurs.
+            q_cv_space.wait(lk, [&]() { return q.empty() || worker_failed; });
+            q_stop = true;
+            q_cv.notify_all();
+            q_cv_space.notify_all();
+        }
+        if (worker && worker->joinable()) {
+            worker->join();
+        }
+        if (worker_failed) {
             auto result = std::make_shared<FollowJointTrajectory::Result>();
             result->error_code = -1;
-            result->error_string = "Canceled";
-            goal_handle->canceled(result);
+            result->error_string = "ServoJ failed (async worker)";
+            goal_handle->abort(result);
             return;
         }
     }
