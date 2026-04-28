@@ -39,7 +39,8 @@ void CRRobotRos2::init()
     this->declare_parameter("follow_joint_trajectory_min_servoj_t_s", 0.004);
     this->declare_parameter("follow_joint_trajectory_async_servoj", false);
     this->declare_parameter("follow_joint_trajectory_async_queue_max", 50);
-    this->declare_parameter("follow_joint_trajectory_pre_wakeup", .004);
+    this->declare_parameter("follow_joint_trajectory_pre_wakeup", .000);
+    this->declare_parameter("follow_joint_trajectory_fixed_dt_compensation", -1.0);
     // Feedback publishing is moved to a separate node (cr_robot_ros2_feedback_node).
     // Keep this default off to minimize interference with trajectory streaming.
     this->declare_parameter("publish_feed_info", false);
@@ -548,7 +549,16 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
     feedback->joint_names = traj.joint_names;
 
     double last_tfs = 0.0;
-    for (size_t i = 0; i < points.size(); ++i) {
+    const auto start_time = std::chrono::steady_clock::now();
+    if (duration_to_seconds(points[0].time_from_start) != 0.0) {
+        auto result = std::make_shared<FollowJointTrajectory::Result>();
+        result->error_code = -1;
+        result->error_string = "Canceled";
+        goal_handle->canceled(result);
+        return;
+       
+    }
+    for (size_t i = 1; i < points.size(); ++i) {
         if (!rclcpp::ok()) {
             auto result = std::make_shared<FollowJointTrajectory::Result>();
             result->error_code = -1;
@@ -565,16 +575,24 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
         }
 
         const auto &pt = points[i];
-        const double tfs = duration_to_seconds(pt.time_from_start);
-        const double dt_raw = (i == 0) ? tfs : (tfs - last_tfs);
-        last_tfs = tfs;
+        const auto tfs = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(duration_to_seconds(pt.time_from_start)));
 
+        const auto abs_wakeup_time = start_time + tfs;
+        // const double dt_raw = (i == 0) ? tfs : (tfs - last_tfs);
+        // last_tfs = tfs;
+        
         // dt is the desired loop period for this point (from time_from_start deltas).
         // Clamp to >= 0 to avoid negative sleeps on malformed trajectories.
-        const double dt = std::max(0.0, dt_raw);
+        // const double dt = std::max(0.0, dt_raw);
 
-        const double dt_cmd = std::max(min_servoj_t_s, dt);
-
+        // make robot arrive at scheduled time
+        // if (this->get_parameter("follow_joint_trajectory_use_dt_compensation").as_bool()) {
+            //     dt_cmd = (start_time + std::chrono::duration<double>(tfs) - std::chrono::steady_clock::now()).count();
+            //     dt_cmd = std::max(min_servoj_t_s, dt_cmd);
+            // } else {
+                //     dt_cmd = std::max(min_servoj_t_s, dt);
+                
+        // }
         auto servo_req = std::make_shared<dobot_msgs_v4::srv::ServoJ::Request>();
         servo_req->a = rad_to_deg(pt.positions[0]);
         servo_req->b = rad_to_deg(pt.positions[1]);
@@ -582,7 +600,19 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
         servo_req->d = rad_to_deg(pt.positions[3]);
         servo_req->e = rad_to_deg(pt.positions[4]);
         servo_req->f = rad_to_deg(pt.positions[5]);
-
+        
+        const double ddt = this->get_parameter("follow_joint_trajectory_fixed_dt_compensation").as_double();
+        double dt_cmd;
+        if( ddt >= 0 ) {
+            const double prev_tfs = duration_to_seconds(points[i-1].time_from_start);
+           
+            dt_cmd = std::max(min_servoj_t_s, duration_to_seconds(pt.time_from_start) - prev_tfs) + ddt;
+            
+        
+        } else {
+            const auto now = std::chrono::steady_clock::now();
+            dt_cmd = std::max(min_servoj_t_s, std::chrono::duration<double>(abs_wakeup_time - now).count());
+        }
         std::ostringstream tparam;
         tparam.setf(std::ios::fixed);
         tparam << std::setprecision(3) << "t=" << dt_cmd;
@@ -591,10 +621,10 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
         const std::string cmd = parseTool::parserServoJRequest2String(servo_req);
         // Timing model (requested): for each point, measure the TCP send time
         // and then wait out the remainder of dt.
-        const auto t0 = std::chrono::steady_clock::now();
+        // const auto t0 = std::chrono::steady_clock::now();
         int err = 0;
         const bool ok = commander_->callRosService(cmd, err);
-        const auto t1 = std::chrono::steady_clock::now();
+        // const auto t1 = std::chrono::steady_clock::now();
         if (!ok) {
             auto result = std::make_shared<FollowJointTrajectory::Result>();
             result->error_code = -1;
@@ -607,8 +637,11 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
         feedback->desired.time_from_start = pt.time_from_start;
         goal_handle->publish_feedback(feedback);
 
-        const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-        const double wait_s = dt - elapsed_s - this->get_parameter("follow_joint_trajectory_pre_wakeup").as_double(); // Subtract a small fudge factor to try to account for overhead in the loop itself.
+        // const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+        // const double wait_s = dt - elapsed_s - this->get_parameter("follow_joint_trajectory_pre_wakeup").as_double(); // Subtract a small fudge factor to try to account for overhead in the loop itself.
+        const auto now2 = std::chrono::steady_clock::now();
+        const double pre_wakeup_s = this->get_parameter("follow_joint_trajectory_pre_wakeup").as_double();
+        const double wait_s = std::chrono::duration<double>(abs_wakeup_time - now2).count() - pre_wakeup_s;
         if (!sleep_with_cancel(wait_s)) {
             auto result = std::make_shared<FollowJointTrajectory::Result>();
             result->error_code = -1;
