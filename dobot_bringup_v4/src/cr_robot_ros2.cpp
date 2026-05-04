@@ -40,7 +40,7 @@ void CRRobotRos2::init()
     this->declare_parameter("follow_joint_trajectory_async_servoj", false);
     this->declare_parameter("follow_joint_trajectory_async_queue_max", 50);
     this->declare_parameter("follow_joint_trajectory_pre_wakeup", .000);
-    this->declare_parameter("follow_joint_trajectory_fixed_dt_compensation", -1.0);
+    this->declare_parameter("follow_joint_trajectory_fixed_dt_compensation", 0.004);
     // Feedback publishing is moved to a separate node (cr_robot_ros2_feedback_node).
     // Keep this default off to minimize interference with trajectory streaming.
     this->declare_parameter("publish_feed_info", false);

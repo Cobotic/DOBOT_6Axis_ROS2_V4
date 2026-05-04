@@ -13,20 +13,43 @@ import os
 import yaml
 
 
+PIPELINE_STRING_KEYS = {"request_adapters", "capabilities", "disable_capabilities"}
+
+
+def package_share_path(package_name):
+    source_override = Path("/opt/ws/src/DOBOT_6Axis_ROS2_V4") / package_name
+    if source_override.exists():
+        return source_override
+    return Path(get_package_share_directory(package_name))
+
+
 def load_yaml(package_name, file_path):
-    package_path = Path(get_package_share_directory(package_name))
+    package_path = package_share_path(package_name)
     absolute_file_path = package_path / file_path
     with absolute_file_path.open("r", encoding="utf-8") as file:
         return yaml.safe_load(file) or {}
 
 
+def normalize_string_param(value):
+    if isinstance(value, str):
+        return ParameterValue(value, value_type=str)
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return ParameterValue(" ".join(item.strip() for item in value if item.strip()), value_type=str)
+    return value
+
+
 def normalize_pipeline_params(params):
-    normalized = dict(params)
-    for key in ("request_adapters", "capabilities"):
-        value = normalized.get(key)
-        if isinstance(value, str):
-            normalized[key] = ParameterValue(value, value_type=str)
-    return normalized
+    if isinstance(params, dict):
+        normalized = {}
+        for key, value in params.items():
+            if key in PIPELINE_STRING_KEYS:
+                normalized[key] = normalize_string_param(value)
+            else:
+                normalized[key] = normalize_pipeline_params(value)
+        return normalized
+    if isinstance(params, list):
+        return [normalize_pipeline_params(item) for item in params]
+    return params
 
 
 def generate_launch_description():
@@ -56,7 +79,7 @@ def generate_launch_description():
             DeclareLaunchArgument("namespace", default_value=""),
             DeclareLaunchArgument(
                 "pilz_config_name",
-                default_value="pilz_industrial_motion_planner_planning.yaml",
+                default_value="pilz_industrial_motion_planner_planning_raw.yaml",
             ),
             OpaqueFunction(function=_expand),
         ]
@@ -107,7 +130,7 @@ def build_move_group_launch(moveit_config, pipeline_params=None):
     }
 
     move_group_params = [
-        moveit_config.to_dict(),
+        normalize_pipeline_params(moveit_config.to_dict()),
         pipeline_params,
         move_group_configuration,
     ]
