@@ -37,6 +37,8 @@ void CRRobotRos2::init()
     // FollowJointTrajectory -> ServoJ tuning
     this->declare_parameter("follow_joint_trajectory_early_send_s", 0.03);
     this->declare_parameter("follow_joint_trajectory_min_servoj_t_s", 0.004);
+    this->declare_parameter("follow_joint_trajectory_servoj_aheadtime", 50.0);
+    this->declare_parameter("follow_joint_trajectory_servoj_gain", 500.0);
     this->declare_parameter("follow_joint_trajectory_async_servoj", false);
     this->declare_parameter("follow_joint_trajectory_async_queue_max", 50);
     this->declare_parameter("follow_joint_trajectory_pre_wakeup", .000);
@@ -48,9 +50,15 @@ void CRRobotRos2::init()
     {
         bool param_async_servoj = false;
         int param_async_queue_max = 50;
+        double param_servoj_aheadtime = 20.0;
+        double param_servoj_gain = 500.0;
         this->get_parameter("follow_joint_trajectory_async_servoj", param_async_servoj);
         this->get_parameter("follow_joint_trajectory_async_queue_max", param_async_queue_max);
+        this->get_parameter("follow_joint_trajectory_servoj_aheadtime", param_servoj_aheadtime);
+        this->get_parameter("follow_joint_trajectory_servoj_gain", param_servoj_gain);
         if (param_async_queue_max < 1) param_async_queue_max = 1;
+        param_servoj_aheadtime = std::clamp(param_servoj_aheadtime, 20.0, 100.0);
+        param_servoj_gain = std::clamp(param_servoj_gain, 200.0, 1000.0);
 
         bool async_servoj = param_async_servoj;
         const char *env_async = std::getenv("ANYROB_FJT_ASYNC_SERVOJ");
@@ -62,48 +70,14 @@ void CRRobotRos2::init()
         }
 
         RCLCPP_INFO(this->get_logger(),
-                    "FJT async ServoJ config (startup): param(follow_joint_trajectory_async_servoj)=%s env(ANYROB_FJT_ASYNC_SERVOJ)=%s -> async_servoj=%s queue_max=%d",
+                    "FJT async ServoJ config (startup): param(follow_joint_trajectory_async_servoj)=%s env(ANYROB_FJT_ASYNC_SERVOJ)=%s -> async_servoj=%s queue_max=%d aheadtime=%.3f gain=%.3f",
                     param_async_servoj ? "true" : "false",
                     (env_async ? env_async : "<unset>"),
                     async_servoj ? "true" : "false",
-                    param_async_queue_max);
+                    param_async_queue_max,
+                    param_servoj_aheadtime,
+                    param_servoj_gain);
     }
-
-    auto maybe_enable_sched_fifo = [this](const char *where) {
-        const char *enabled = std::getenv("ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO");
-        if (enabled == nullptr || enabled[0] == '\0' || std::strcmp(enabled, "0") == 0 || std::strcmp(enabled, "false") == 0 ||
-            std::strcmp(enabled, "False") == 0) {
-            return;
-        }
-
-        int prio = 50;
-        if (const char *p = std::getenv("ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO_PRIORITY")) {
-            try {
-                prio = std::stoi(p);
-            } catch (...) {
-                prio = 50;
-            }
-        }
-        if (prio < 1) prio = 1;
-        if (prio > 99) prio = 99;
-
-        sched_param sp;
-        std::memset(&sp, 0, sizeof(sp));
-        sp.sched_priority = prio;
-        const int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
-        if (rc != 0) {
-            RCLCPP_WARN(this->get_logger(),
-                        "SCHED_FIFO enable failed (%s, prio=%d). Need CAP_SYS_NICE and rtprio ulimit. Error: %s",
-                        where,
-                        prio,
-                        std::strerror(rc));
-            return;
-        }
-        RCLCPP_INFO(this->get_logger(), "SCHED_FIFO enabled (%s, prio=%d)", where, prio);
-    };
-
-    // Enable FIFO as early as possible so subsequently created threads inherit it.
-    maybe_enable_sched_fifo("CRRobotRos2::init");
 
     this->get_parameter("robot_ip_address", robotIp);
     this->get_parameter("robot_type", robotType);
@@ -393,19 +367,19 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     }
 
     {
-        bool publish_feed_info = false;
-        this->get_parameter("publish_feed_info", publish_feed_info);
-        if (publish_feed_info)
-        {
-            kPublisherInfo = this->create_publisher<std_msgs::msg::String>(topicFeedInfo, 10);
-            threadPubFeedBackInfo = std::thread(&CRRobotRos2::pubFeedBackInfo, this);
-            threadPubFeedBackInfo.detach();
-            RCLCPP_INFO(this->get_logger(), "FeedInfo publisher enabled in driver node");
-        }
-        else
-        {
+        // bool publish_feed_info = false;
+        // this->get_parameter("publish_feed_info", publish_feed_info);
+        // if (publish_feed_info)
+        // {
+        //     kPublisherInfo = this->create_publisher<std_msgs::msg::String>(topicFeedInfo, 10);
+        //     threadPubFeedBackInfo = std::thread(&CRRobotRos2::pubFeedBackInfo, this);
+        //     threadPubFeedBackInfo.detach();
+        //     RCLCPP_INFO(this->get_logger(), "FeedInfo publisher enabled in driver node");
+        // }
+        // else
+        // {
             RCLCPP_INFO(this->get_logger(), "FeedInfo publisher disabled in driver node (use feedback node)");
-        }
+        // }
     }
 }
 
@@ -525,6 +499,14 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
     this->get_parameter("follow_joint_trajectory_min_servoj_t_s", min_servoj_t_s);
     min_servoj_t_s = std::max(0.0, min_servoj_t_s);
 
+    double servoj_aheadtime = 50.0;
+    this->get_parameter("follow_joint_trajectory_servoj_aheadtime", servoj_aheadtime);
+    servoj_aheadtime = std::clamp(servoj_aheadtime, 20.0, 100.0);
+
+    double servoj_gain = 500.0;
+    this->get_parameter("follow_joint_trajectory_servoj_gain", servoj_gain);
+    servoj_gain = std::clamp(servoj_gain, 200.0, 1000.0);
+
     auto sleep_with_cancel = [&](double seconds) -> bool {
         if (seconds <= 0.0) {
             return true;
@@ -616,7 +598,16 @@ void CRRobotRos2::execute_follow_joint_trajectory(const std::shared_ptr<GoalHand
         std::ostringstream tparam;
         tparam.setf(std::ios::fixed);
         tparam << std::setprecision(3) << "t=" << dt_cmd;
-        servo_req->param_value = {tparam.str()};
+
+        std::ostringstream aheadtime_param;
+        aheadtime_param.setf(std::ios::fixed);
+        aheadtime_param << std::setprecision(3) << "aheadtime=" << servoj_aheadtime;
+
+        std::ostringstream gain_param;
+        gain_param.setf(std::ios::fixed);
+        gain_param << std::setprecision(3) << "gain=" << servoj_gain;
+
+        servo_req->param_value = {tparam.str(), aheadtime_param.str(), gain_param.str()};
 
         const std::string cmd = parseTool::parserServoJRequest2String(servo_req);
         // Timing model (requested): for each point, measure the TCP send time

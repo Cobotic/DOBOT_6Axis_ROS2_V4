@@ -11,60 +11,13 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <memory>
-#include <pthread.h>
-#include <sched.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace
 {
-static int env_int(const char *name, int default_value)
-{
-    const char *v = std::getenv(name);
-    if (!v || !*v)
-        return default_value;
-    try
-    {
-        return std::stoi(std::string(v));
-    }
-    catch (...)
-    {
-        return default_value;
-    }
-}
-
-static bool env_flag_with_fallback(const char *primary, const char *fallback, bool default_value)
-{
-    const char *p = std::getenv(primary);
-    if (p && *p)
-    {
-        const int v = env_int(primary, default_value ? 1 : 0);
-        return v != 0;
-    }
-    const int v = env_int(fallback, default_value ? 1 : 0);
-    return v != 0;
-}
-
-static int env_int_with_fallback(const char *primary, const char *fallback, int default_value)
-{
-    const char *p = std::getenv(primary);
-    if (p && *p)
-        return env_int(primary, default_value);
-    return env_int(fallback, default_value);
-}
-
-static bool try_enable_sched_fifo(int prio)
-{
-    sched_param sp;
-    memset(&sp, 0, sizeof(sp));
-    sp.sched_priority = prio;
-    const int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
-    return rc == 0;
-}
-
 static nlohmann::json realtime_to_json(const RealTimeData &rt)
 {
     nlohmann::json root;
@@ -199,27 +152,6 @@ public:
 
     void init()
     {
-        const bool sched_fifo = env_flag_with_fallback(
-            "ANYROB_FEEDBACK_SCHED_FIFO",
-            "ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO",
-            false);
-        const int prio = env_int_with_fallback(
-            "ANYROB_FEEDBACK_SCHED_FIFO_PRIORITY",
-            "ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO_PRIORITY",
-            99);
-
-        if (sched_fifo)
-        {
-            if (try_enable_sched_fifo(prio))
-            {
-                RCLCPP_INFO(this->get_logger(), "SCHED_FIFO enabled (feedback node, prio=%d)", prio);
-            }
-            else
-            {
-                RCLCPP_WARN(this->get_logger(), "SCHED_FIFO requested for feedback node but failed (prio=%d)", prio);
-            }
-        }
-
         this->declare_parameter("robot_ip_address", "192.168.1.6");
         this->declare_parameter("robot_number", 1);
         this->declare_parameter("robot_node_name", "dobot_bringup_ros2");
@@ -274,20 +206,6 @@ public:
 private:
     void joint_loop()
     {
-        // Defensive: ensure the worker thread has FIFO (in case the parent didn't).
-        const bool sched_fifo = env_flag_with_fallback(
-            "ANYROB_FEEDBACK_SCHED_FIFO",
-            "ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO",
-            false);
-        const int prio = env_int_with_fallback(
-            "ANYROB_FEEDBACK_SCHED_FIFO_PRIORITY",
-            "ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO_PRIORITY",
-            99);
-        if (sched_fifo)
-        {
-            (void)try_enable_sched_fifo(prio);
-        }
-
         rclcpp::Rate rate(joint_rate_hz_);
         while (rclcpp::ok() && run_.load())
         {
@@ -324,20 +242,6 @@ private:
 
     void feed_loop()
     {
-        // Defensive: ensure the worker thread has FIFO (in case the parent didn't).
-        const bool sched_fifo = env_flag_with_fallback(
-            "ANYROB_FEEDBACK_SCHED_FIFO",
-            "ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO",
-            false);
-        const int prio = env_int_with_fallback(
-            "ANYROB_FEEDBACK_SCHED_FIFO_PRIORITY",
-            "ANYROB_ACTION_MOVE_SERVER_SCHED_FIFO_PRIORITY",
-            99);
-        if (sched_fifo)
-        {
-            (void)try_enable_sched_fifo(prio);
-        }
-
         rclcpp::Rate rate(feed_rate_hz_);
         while (rclcpp::ok() && run_.load())
         {
